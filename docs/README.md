@@ -10,12 +10,35 @@ Declarative service contract for MariaDB 10.11 aligned with the shared infrastru
 - Bare-metal systemd unit
 
 ### Exports
+- Global environment exports retain backwards compatibility for single-tenant consumers:
+  ```
+  DATABASE_HOST={{ service_ip }}
+  DATABASE_PORT={{ mariadb_service_port }}
+  DATABASE_NAME={{ mariadb_database }}
+  DATABASE_USER={{ mariadb_user }}
+  ```
+- When `mariadb_schemas` is populated, the role renders one export file per schema at
+  `{{ mariadb_exports_directory }}/<schema>.env` containing host/port/name/user pairs. Consumers
+  can source the file that matches their schema without the provider knowing about individual
+  applications.
+
+### Multi-tenant Schemas
+Define additional databases and users with the `mariadb_schemas` list. Each item must provide a
+schema name, user, and password (directly or indirectly via another variable):
+
+```yaml
+mariadb_schemas:
+  - name: erpnext
+    user: erpnext
+    password_var: vault_erp_db_password
+  - name: wordpress
+    user: wp
+    password: "{{ vault_wordpress_db_password }}"
 ```
-DATABASE_HOST={{ service_ip }}
-DATABASE_PORT={{ mariadb_service_port }}
-DATABASE_NAME={{ mariadb_database }}
-DATABASE_USER={{ mariadb_user }}
-```
+
+The role waits for MariaDB to become reachable, creates the requested schemas and scoped users,
+and drops export files for each entry. Existing `mariadb_database` / `mariadb_user` variables
+remain available for simple single-tenant deployments.
 
 ### Secrets
 - `MYSQL_ROOT_PASSWORD` -> root account password
@@ -46,6 +69,9 @@ All secrets must be provided through inventory, Vault, or an external secret man
 | `mariadb_publish_port` | `false` | Opt-in host publishing of TCP/3306 |
 | `mariadb_database` | `appdb` | Default schema created for workloads |
 | `mariadb_user` | `app` | Application database user |
+| `mariadb_schemas` | `[]` | Optional list of additional schema/user definitions |
+| `mariadb_admin_host` | `{{ service_ip }}` | Hostname/IP used for administrative connections |
+| `mariadb_exports_directory` | `/srv/db/exports` | Directory for per-schema export files |
 | `mariadb_data_volume` | `mariadb-data` | Named volume for container targets |
 | `mariadb_container_ip` | `192.168.100.10` | LXC container address |
 | `mariadb_container_vmid` | `200` | Proxmox VMID |
@@ -74,4 +100,11 @@ Adjust these in inventory to tune runtime specifics. Any additional runtime temp
         mariadb_backup_aws_access_key_id: "{{ vault_mariadb_backup_access_key }}"
         mariadb_backup_aws_secret_access_key: "{{ vault_mariadb_backup_secret_key }}"
         mariadb_binlog_s3_path: s3://prod-backups/mariadb/binlog
+        mariadb_schemas:
+          - name: erpnext
+            user: erpnext
+            password_var: vault_erpnext_db_password
+          - name: wordpress
+            user: wp
+            password_var: vault_wordpress_db_password
 ```
