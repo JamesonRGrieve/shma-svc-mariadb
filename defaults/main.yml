@@ -13,6 +13,8 @@ service_env:
     value: "{{ mariadb_database }}"
   - name: MYSQL_USER
     value: "{{ mariadb_user }}"
+  - name: MYSQL_PASSWORD
+    secret: MYSQL_PASSWORD
   - name: MARIADB_EXTRA_FLAGS
     value: >-
       {{ [

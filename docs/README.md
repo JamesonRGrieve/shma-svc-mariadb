@@ -17,6 +17,9 @@ Declarative service contract for MariaDB 10.11 aligned with the shared infrastru
   DATABASE_NAME={{ mariadb_database }}
   DATABASE_USER={{ mariadb_user }}
   ```
+- Passwords are intentionally not exported. Dependents must declare a `MYSQL_PASSWORD` secret
+  requirement in the dependency registry and fetch it through the shared secret adapter used by
+  their runtime.
 - When `mariadb_schemas` is populated, the role renders one export file per schema at
   `{{ mariadb_exports_directory }}/<schema>.env` containing host/port/name/user pairs. Consumers
   can source the file that matches their schema without the provider knowing about individual
