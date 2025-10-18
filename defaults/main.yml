@@ -1,44 +1,107 @@
----
-# Service contract for MariaDB
 service_id: mariadb
+service_name: mariadb
+service_unit_name: mariadb
+service_image: docker.io/library/mariadb:10.11
 version: "10.11"
-
-# Dependencies
+service_ip: "{{ mariadb_container_ip }}"
+service_ports:
+  - target: 3306
+    published: {{ mariadb_service_port }}
+    protocol: tcp
+service_env:
+  - name: MYSQL_DATABASE
+    value: "{{ mariadb_database }}"
+  - name: MYSQL_USER
+    value: "{{ mariadb_user }}"
+service_volumes:
+  - name: data
+    source: "{{ mariadb_data_volume }}"
+    target: /var/lib/mysql
+    driver: local
+    size: "{{ mariadb_container_storage_gb }}Gi"
+service_resources:
+  memory_mb: "{{ mariadb_container_memory_mb }}"
+  cpu_cores: "{{ mariadb_container_cpu_cores }}"
+service_namespace: "{{ mariadb_kubernetes_namespace }}"
+service_replicas: "{{ mariadb_kubernetes_replicas }}"
+service_packages:
+  - mariadb-server
+  - mariadb-client
+  - python3-pymysql
+service_services:
+  - name: mariadb
+    enabled: true
+    state: started
+service_container:
+  vmid: "{{ mariadb_container_vmid }}"
+  hostname: "{{ service_name }}"
+  ostemplate: "{{ mariadb_container_template }}"
+  disk: "{{ mariadb_container_storage_gb }}"
+  cores: "{{ mariadb_container_cpu_cores }}"
+  memory: "{{ mariadb_container_memory_mb }}"
+  swap: "{{ mariadb_container_swap_mb }}"
+  bridge: "{{ mariadb_container_bridge }}"
+  cidr: "{{ mariadb_container_cidr }}"
+  gateway: "{{ mariadb_container_gateway }}"
+  interface: "{{ mariadb_container_interface }}"
+  onboot: yes
+  unprivileged: yes
+  features: nesting=1,keyctl=1
 requires: []
-
-# What this service exports for other services
 exports:
   env:
-    - name: MARIADB_HOST
-      value: "{{ ansible_default_ipv4.address }}"
-    - name: MARIADB_PORT
-      value: "3306"
-    - name: MARIADB_USER
-      value: "{{ mariadb_user | default('app') }}"
-    - name: MARIADB_DATABASE
-      value: "{{ mariadb_database | default('appdb') }}"
-
-# Storage requirements
+    - name: DATABASE_HOST
+      value: "{{ service_ip }}"
+    - name: DATABASE_PORT
+      value: "{{ mariadb_service_port | string }}"
+    - name: DATABASE_NAME
+      value: "{{ mariadb_database }}"
+    - name: DATABASE_USER
+      value: "{{ mariadb_user }}"
 storage:
   - name: data
     path: /var/lib/mysql
-    size_gb: "{{ mariadb_storage_gb | default(50) }}"
-
-# Health check
+    size: "{{ mariadb_container_storage_gb }}G"
 health:
-  cmd: ["mysqladmin", "ping", "-h", "localhost"]
+  cmd:
+    - mysqladmin
+    - ping
+    - -h
+    - 127.0.0.1
+    - -P
+    - "{{ mariadb_service_port | string }}"
   interval: 10s
   timeout: 5s
-  retries: 3
-
-# Runtime templates
+  retries: 5
 runtime_templates:
-  lxc: templates/lxc.yml.j2
+  proxmox: proxmox.yml.j2
+  docker: docker.yml.j2
+  podman: podman.yml.j2
+  kubernetes: kubernetes.yml.j2
+  baremetal: baremetal.yml.j2
+secrets:
+  env:
+    - name: MYSQL_ROOT_PASSWORD
+      value: "{{ mariadb_root_password }}"
+    - name: MYSQL_PASSWORD
+      value: "{{ mariadb_user_password }}"
 
-# Service-specific config
-mariadb_root_password: "{{ lookup('env', 'MARIADB_ROOT_PASSWORD') }}"
-mariadb_container_id: 200
-mariadb_hostname: mariadb
-mariadb_memory: 2048
-mariadb_cores: 2
-mariadb_ip: "192.168.0.200"
+mariadb_service_port: 3306
+mariadb_database: appdb
+mariadb_user: app
+mariadb_data_volume: mariadb-data
+mariadb_container_vmid: 200
+mariadb_container_ip: 192.168.100.10
+mariadb_container_gateway: 192.168.100.1
+mariadb_container_cidr: 24
+mariadb_container_bridge: vmbr0
+mariadb_container_interface: eth0
+mariadb_container_cpu_cores: 2
+mariadb_container_memory_mb: 2048
+mariadb_container_swap_mb: 2048
+mariadb_container_storage_gb: 50
+mariadb_container_template: local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
+mariadb_root_password: "{{ lookup('env', 'MARIADB_ROOT_PASSWORD') | default('change-me-root', true) }}"
+mariadb_user_password: "{{ lookup('env', 'MARIADB_USER_PASSWORD') | default('change-me-user', true) }}"
+mariadb_kubernetes_namespace: databases
+mariadb_kubernetes_replicas: 1

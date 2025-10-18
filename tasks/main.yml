@@ -1,16 +1,49 @@
 ---
-- name: Validate MariaDB service schema
+- name: Validate service contract
   include_role:
     name: common.validate_schema
-  vars:
-    service: "{{ service_id }}"
 
-- name: Render MariaDB for LXC runtime
-  include_role:
-    name: common.render_runtime
+- name: Determine target runtimes
   vars:
-    service: "{{ service_id }}"
-    runtime: lxc
+    candidate_runtimes: "{{ runtime | default(target_runtimes | default(runtime_templates.keys() | list)) }}"
+  set_fact:
+    service_target_runtimes: "{{ candidate_runtimes if (candidate_runtimes is iterable and candidate_runtimes is not string) else [candidate_runtimes] }}"
 
-- name: Deploy MariaDB container
-  include_tasks: "{{ runtime_output }}"
+- name: Set infrastructure template root
+  set_fact:
+    infrastructure_template_root: "{{ [role_path | dirname, 'infrastructure', 'templates'] | path_join }}"
+
+- name: Build runtime template map
+  set_fact:
+    service_runtime_templates: "{{ service_runtime_templates | default({}) | combine({ item.key: ([infrastructure_template_root, item.value] | path_join) }) }}"
+  loop: "{{ runtime_templates | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Ensure requested runtimes are supported
+  assert:
+    that:
+      - runtime_item in service_runtime_templates
+    fail_msg: "Runtime {{ runtime_item }} not supported by service {{ service_id }}"
+  loop: "{{ service_target_runtimes }}"
+  loop_control:
+    loop_var: runtime_item
+
+- name: Render and apply runtime(s)
+  loop: "{{ service_target_runtimes }}"
+  loop_control:
+    loop_var: runtime_item
+    label: "{{ runtime_item }}"
+  block:
+    - name: Render runtime {{ runtime_item }}
+      include_role:
+        name: common.render_runtime
+      vars:
+        runtime_templates: "{{ service_runtime_templates }}"
+        runtime: "{{ runtime_item }}"
+
+    - name: Apply runtime {{ runtime_item }}
+      include_role:
+        name: common.apply_runtime
+      vars:
+        runtime: "{{ runtime_item }}"
