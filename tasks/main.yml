@@ -1,0 +1,16 @@
+---
+- name: Validate MariaDB service schema
+  include_role:
+    name: common.validate_schema
+  vars:
+    service: "{{ service_id }}"
+
+- name: Render MariaDB for LXC runtime
+  include_role:
+    name: common.render_runtime
+  vars:
+    service: "{{ service_id }}"
+    runtime: lxc
+
+- name: Deploy MariaDB container
+  include_tasks: "{{ runtime_output }}"

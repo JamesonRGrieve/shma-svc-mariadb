@@ -1,0 +1,44 @@
+---
+# Service contract for MariaDB
+service_id: mariadb
+version: "10.11"
+
+# Dependencies
+requires: []
+
+# What this service exports for other services
+exports:
+  env:
+    - name: MARIADB_HOST
+      value: "{{ ansible_default_ipv4.address }}"
+    - name: MARIADB_PORT
+      value: "3306"
+    - name: MARIADB_USER
+      value: "{{ mariadb_user | default('app') }}"
+    - name: MARIADB_DATABASE
+      value: "{{ mariadb_database | default('appdb') }}"
+
+# Storage requirements
+storage:
+  - name: data
+    path: /var/lib/mysql
+    size_gb: "{{ mariadb_storage_gb | default(50) }}"
+
+# Health check
+health:
+  cmd: ["mysqladmin", "ping", "-h", "localhost"]
+  interval: 10s
+  timeout: 5s
+  retries: 3
+
+# Runtime templates
+runtime_templates:
+  lxc: templates/lxc.yml.j2
+
+# Service-specific config
+mariadb_root_password: "{{ lookup('env', 'MARIADB_ROOT_PASSWORD') }}"
+mariadb_container_id: 200
+mariadb_hostname: mariadb
+mariadb_memory: 2048
+mariadb_cores: 2
+mariadb_ip: "192.168.0.200"
