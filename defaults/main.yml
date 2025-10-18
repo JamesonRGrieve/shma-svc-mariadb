@@ -15,6 +15,10 @@ service_env:
     value: "{{ mariadb_user }}"
   - name: MYSQL_PASSWORD
     secret: MYSQL_PASSWORD
+  - name: MARIADB_CHARACTER_SET_SERVER
+    value: "{{ mariadb_character_set }}"
+  - name: MARIADB_COLLATION_SERVER
+    value: "{{ mariadb_collation }}"
   - name: MARIADB_EXTRA_FLAGS
     value: >-
       {{ [
@@ -32,6 +36,105 @@ service_volumes:
     target: /var/lib/mysql
     driver: local
     size: "{{ mariadb_container_storage_gb }}Gi"
+service_files:
+  - path: /etc/mysql/conf.d/99-hardening.cnf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |-
+      [mysqld]
+      max_connect_errors = {{ mariadb_max_connect_errors }}
+      max_password_errors = {{ mariadb_max_password_errors }}
+      transaction_isolation = {{ mariadb_tx_isolation }}
+      performance_schema = {{ 'ON' if mariadb_performance_schema_enabled else 'OFF' }}
+      slow_query_log = {{ 1 if mariadb_slow_query_log_enabled else 0 }}
+      long_query_time = {{ mariadb_long_query_time }}
+      slow_query_log_file = {{ mariadb_slow_query_log_file }}
+      max_allowed_packet = 64M
+      character-set-server = {{ mariadb_character_set }}
+      collation-server = {{ mariadb_collation }}
+  - path: "{{ mariadb_health_check_script }}"
+    owner: root
+    group: root
+    mode: "0755"
+    content: |-
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      HOST="127.0.0.1"
+      PORT="{{ mariadb_service_port }}"
+      DATA_DIR="/var/lib/mysql"
+      WEBHOOK_URL="{{ mariadb_health_webhook_url }}"
+
+      notify_webhook() {
+        local payload="$1"
+        if [[ -n "$WEBHOOK_URL" ]] && command -v curl >/dev/null 2>&1; then
+          local escaped_payload
+          escaped_payload=$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read())[1:-1])' 2>/dev/null || printf '%s' "$payload" | sed 's/"/\\"/g')
+          curl -fsS -X POST -H 'Content-Type: application/json' -d "{\"service\":\"{{ service_name }}\",\"status\":\"unhealthy\",\"message\":\"${escaped_payload}\"}" "$WEBHOOK_URL" || true
+        fi
+      }
+
+      fail() {
+        local message="$1"
+        echo "$message" >&2
+        notify_webhook "$message"
+        exit 1
+      }
+
+      MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-}"
+      if [[ -z "$MYSQL_ROOT_PASSWORD" ]]; then
+        fail "MYSQL_ROOT_PASSWORD is not available to health check"
+      fi
+      export MYSQL_PWD="$MYSQL_ROOT_PASSWORD"
+
+      if ! mysqladmin ping -h "$HOST" -P "$PORT" -uroot --connect-timeout=5 >/dev/null 2>&1; then
+        fail "mysqladmin ping failed"
+      fi
+
+      threads=$(mysql -h "$HOST" -P "$PORT" -uroot -Nse "SHOW GLOBAL STATUS LIKE 'Threads_connected';" 2>/dev/null | awk '{print $2}')
+      threads=${threads:-0}
+      if [[ -z "$threads" ]]; then
+        fail "Unable to read Threads_connected"
+      fi
+
+      max_connections={{ mariadb_max_connections | int }}
+      threshold={{ mariadb_health_connection_threshold_count | int }}
+      if (( threshold < 1 )); then
+        threshold=1
+      fi
+
+      if (( threads >= max_connections )); then
+        fail "Threads_connected $threads reached configured max_connections $max_connections"
+      fi
+
+      if (( threads >= threshold )); then
+        fail "Threads_connected $threads exceeded alert threshold $threshold"
+      fi
+
+      disk_pct=$(df --output=pcent "$DATA_DIR" 2>/dev/null | tail -1 | tr -dc '0-9')
+      disk_pct=${disk_pct:-0}
+      if (( disk_pct >= {{ mariadb_health_disk_usage_threshold | int }} )); then
+        fail "Disk utilization ${disk_pct}% at $DATA_DIR exceeds {{ mariadb_health_disk_usage_threshold }}% threshold"
+      fi
+
+{% if mariadb_replication_enabled %}
+      replication_status=$(mysql -h "$HOST" -P "$PORT" -uroot -e "SHOW REPLICA STATUS\G" 2>/dev/null || true)
+      if [[ -z "$replication_status" ]]; then
+        replication_status=$(mysql -h "$HOST" -P "$PORT" -uroot -e "SHOW SLAVE STATUS\G" 2>/dev/null || true)
+      fi
+      if [[ -z "$replication_status" ]]; then
+        fail "Replication status unavailable"
+      fi
+      if ! grep -q "Slave_IO_Running: Yes" <<<"$replication_status"; then
+        fail "Replication IO thread not running"
+      fi
+      if ! grep -q "Slave_SQL_Running: Yes" <<<"$replication_status"; then
+        fail "Replication SQL thread not running"
+      fi
+{% endif %}
+
+      echo "ok"
 service_firewall:
   iptables:
     inbound:
@@ -84,18 +187,17 @@ exports:
       value: "{{ mariadb_database }}"
     - name: DATABASE_USER
       value: "{{ mariadb_user }}"
+    - name: DATABASE_PASSWORD
+      value: "{{ mariadb_user_password if mariadb_exports_include_credentials else omit }}"
+    - name: DATABASE_VERSION
+      value: "{{ version }}"
 storage:
   - name: data
     path: /var/lib/mysql
     size: "{{ mariadb_container_storage_gb }}G"
 health:
   cmd:
-    - mysqladmin
-    - ping
-    - -h
-    - 127.0.0.1
-    - -P
-    - "{{ mariadb_service_port | string }}"
+    - "{{ mariadb_health_check_script }}"
   interval: 10s
   timeout: 5s
   retries: 5
@@ -144,7 +246,49 @@ mariadb_user: app
 mariadb_data_volume: mariadb-data
 mariadb_admin_host: "{{ service_ip }}"
 mariadb_schemas: []
+mariadb_reserved_schema_names:
+  - information_schema
+  - mysql
+  - performance_schema
+  - sys
+mariadb_schema_user_default_privileges: &mariadb_default_privileges
+  - SELECT
+  - INSERT
+  - UPDATE
+  - DELETE
+  - CREATE
+  - DROP
+  - INDEX
+  - ALTER
+mariadb_schema_privilege_levels:
+  standard:
+    privileges: *mariadb_default_privileges
+    grant_option: false
+  read_only:
+    privileges:
+      - SELECT
+    grant_option: false
+  with_grant_option:
+    privileges: *mariadb_default_privileges
+    grant_option: true
+mariadb_schema_default_state: present
+mariadb_exports_include_credentials: false
 mariadb_exports_directory: /srv/db/exports
+mariadb_exports_directory_mode: "0755"
+mariadb_exports_file_mode: "0640"
+mariadb_exports_owner: root
+mariadb_exports_group: root
+mariadb_health_disk_usage_threshold: 90
+mariadb_health_connection_utilization_threshold: 0.9
+mariadb_health_connection_threshold_count: "{{ (mariadb_max_connections * mariadb_health_connection_utilization_threshold) | round(0, 'floor') | int }}"
+mariadb_health_webhook_url: ""
+mariadb_replication_enabled: false
+mariadb_health_check_script: /usr/local/bin/mariadb-healthcheck.sh
+mariadb_tx_isolation: READ-COMMITTED
+mariadb_performance_schema_enabled: true
+mariadb_slow_query_log_enabled: true
+mariadb_long_query_time: 2
+mariadb_slow_query_log_file: /var/log/mysql/slow.log
 mariadb_container_vmid: 200
 mariadb_container_ip: 192.168.100.10
 mariadb_container_gateway: 192.168.100.1
@@ -162,18 +306,17 @@ mariadb_kubernetes_namespace: databases
 mariadb_kubernetes_replicas: 1
 mariadb_publish_port: false
 mariadb_internal_network: mariadb-internal
-mariadb_allowed_cidrs:
-  - 10.0.0.0/8
-  - 172.16.0.0/12
-  - 192.168.0.0/16
+mariadb_allowed_cidrs: []
+mariadb_character_set: utf8mb4
+mariadb_collation: utf8mb4_unicode_ci
 mariadb_innodb_buffer_pool_size: 256M
 mariadb_max_connections: 151
+mariadb_max_connect_errors: 20
+mariadb_max_password_errors: 6
 mariadb_root_allowed_hosts:
   - localhost
   - 127.0.0.1
   - ::1
-  - "{{ mariadb_admin_host }}"
-  - "{{ ansible_default_ipv4.address | default(None) }}"
 mariadb_root_disallowed_hosts:
   - "%"
 mariadb_remove_test_database: true
@@ -183,17 +326,19 @@ mariadb_backups:
     tool: mysqldump
     schedule: "0 2 * * *"
     restic_repository: "{{ mariadb_backup_restic_repository }}"
+    extra_args:
+      - --ignore-database=mysql
+      - --ignore-database=information_schema
     retention:
       keep_daily: 7
       keep_weekly: 4
       keep_monthly: 6
-  physical:
-    enabled: false
-    tool: innobackupex
+    verify_repository: true
   binlog_shipping:
     enabled: true
     s3_path: "{{ mariadb_binlog_s3_path }}"
     retention_hours: 168
+    checksum: md5
 mariadb_backup_restic_repository: "{{ lookup('env', 'MARIADB_RESTIC_REPOSITORY') | default('s3:s3.amazonaws.com/example-bucket/mariadb', true) }}"
 mariadb_backup_restic_password: "{{ lookup('env', 'MARIADB_RESTIC_PASSWORD') | default('change-me-restic', true) }}"
 mariadb_backup_aws_access_key_id: "{{ lookup('env', 'MARIADB_AWS_ACCESS_KEY_ID') | default('change-me-access-key', true) }}"

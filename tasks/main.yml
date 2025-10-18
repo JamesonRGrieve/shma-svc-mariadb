@@ -16,8 +16,16 @@
       - mariadb_user_password | length > 0
       - mariadb_root_password not in mariadb_default_passwords
       - mariadb_user_password not in mariadb_default_passwords
-    fail_msg: >-
+  fail_msg: >-
       MariaDB root/user credentials must be provided via secrets or vault entries; the default placeholders are insecure.
+
+- name: Validate firewall CIDR configuration
+  assert:
+    that:
+      - mariadb_allowed_cidrs is defined
+      - mariadb_allowed_cidrs | length > 0
+    fail_msg: >-
+      Define mariadb_allowed_cidrs explicitly to scope database ingress to known networks; the role no longer defaults to broad RFC1918 ranges.
 
 - name: Validate backup credentials when logical backups are enabled
   when: mariadb_backups.logical.enabled | bool
@@ -37,8 +45,39 @@
       - mariadb_backup_restic_password not in mariadb_backup_placeholder_values
       - mariadb_backup_aws_access_key_id not in mariadb_backup_placeholder_values
       - mariadb_backup_aws_secret_access_key not in mariadb_backup_placeholder_values
-    fail_msg: >-
+  fail_msg: >-
       Restic repository credentials must be stored in secrets (e.g. Vault or Kubernetes Secret) and cannot use the provided placeholders.
+
+- name: Validate backup retention window hierarchy
+  when: mariadb_backups.logical.enabled | bool
+  vars:
+    keep_daily: "{{ mariadb_backups.logical.retention.keep_daily | int }}"
+    keep_weekly: "{{ mariadb_backups.logical.retention.keep_weekly | int }}"
+    keep_monthly: "{{ mariadb_backups.logical.retention.keep_monthly | int }}"
+  assert:
+    that:
+      - keep_monthly >= keep_weekly
+      - keep_weekly >= keep_daily
+  fail_msg: >-
+      Logical backup retention must satisfy keep_monthly >= keep_weekly >= keep_daily to avoid overlapping pruning windows.
+
+- name: Perform Restic repository preflight check
+  when:
+    - mariadb_backups.logical.enabled | bool
+    - mariadb_backups.logical.verify_repository | default(false)
+  command:
+    argv:
+      - restic
+      - snapshots
+      - --repo
+      - "{{ mariadb_backups.logical.restic_repository | default(mariadb_backup_restic_repository) }}"
+  environment:
+    RESTIC_PASSWORD: "{{ mariadb_backup_restic_password }}"
+    AWS_ACCESS_KEY_ID: "{{ mariadb_backup_aws_access_key_id }}"
+    AWS_SECRET_ACCESS_KEY: "{{ mariadb_backup_aws_secret_access_key }}"
+  register: mariadb_restic_preflight
+  changed_when: false
+  no_log: true
 
 - name: Validate binlog shipping configuration
   when: mariadb_backups.binlog_shipping.enabled | bool
@@ -57,50 +96,97 @@
 - name: Validate multi-schema configuration
   when: (mariadb_schemas | length) > 0
   block:
-    - name: Ensure schema definitions declare name, user, and credentials
+    - name: Ensure schema definitions declare name, users, and valid state
       assert:
         that:
           - item.name is defined
           - item.name | length > 0
-          - item.user is defined
-          - item.user | length > 0
-          - (item.password is defined) or (item.password_var is defined)
+          - item.name not in mariadb_reserved_schema_names
+          - item.users is defined
+          - item.users | length > 0
+          - (item.state | default(mariadb_schema_default_state)) in ['present', 'absent']
         fail_msg: >-
-          Each entry in mariadb_schemas must provide name, user, and either password or password_var.
+          Each entry in mariadb_schemas must define a non-reserved name, at least one user, and a state of present|absent.
       loop: "{{ mariadb_schemas }}"
       loop_control:
         label: "{{ item.name | default('unnamed') }}"
 
-    - name: Resolve schema credentials
+    - name: Ensure schema user definitions are complete
       vars:
-        schema_password_var: "{{ item.password_var | default(None) }}"
-        schema_password: >-
-          {% if item.password is defined %}
-          {{ item.password }}
-          {% elif schema_password_var is not none %}
-          {{ lookup('vars', schema_password_var, default='') }}
-          {% else %}
-          {% endif %}
-      set_fact:
-        mariadb_resolved_schemas: "{{ (mariadb_resolved_schemas | default([])) + [ {
-          'name': item.name,
-          'user': item.user,
-          'password': schema_password | trim
-        } ] }}"
+        schema_item: "{{ item.0 }}"
+        user_item: "{{ item.1 }}"
+        privilege_level: "{{ user_item.privilege_level | default('standard') }}"
+      assert:
+        that:
+          - user_item.name is defined
+          - user_item.name | length > 0
+          - (user_item.password is defined) or (user_item.password_var is defined)
+          - privilege_level in mariadb_schema_privilege_levels.keys()
+        fail_msg: >-
+          Schema {{ schema_item.name }} user definitions must include a username, credentials, and an optional privilege_level from {{ mariadb_schema_privilege_levels.keys() | list }}.
+      loop: "{{ mariadb_schemas | subelements('users') }}"
+      loop_control:
+        label: "{{ item.0.name }}::{{ item.1.name | default('unnamed-user') }}"
+
+    - name: Resolve schema credentials and privileges
+      vars:
+        schema_item: "{{ item }}"
+        schema_state: "{{ item.state | default(mariadb_schema_default_state) }}"
+      block:
+        - set_fact:
+            mariadb_current_schema_users: []
+
+        - name: Resolve users for schema {{ schema_item.name }}
+          vars:
+            user_password_var: "{{ user.password_var | default(None) }}"
+            user_password_raw: >-
+              {% if user.password is defined %}
+              {{ user.password }}
+              {% elif user_password_var is not none %}
+              {{ lookup('vars', user_password_var, default='') }}
+              {% else %}
+              {% endif %}
+            user_password_trimmed: "{{ user_password_raw | trim }}"
+            privilege_level: "{{ user.privilege_level | default('standard') }}"
+            privilege_spec: "{{ mariadb_schema_privilege_levels[privilege_level] }}"
+            privilege_list: "{{ user.privileges | default(privilege_spec.privileges) }}"
+            grant_option_flag: "{{ user.grant_option | default(privilege_spec.grant_option | default(false)) }}"
+            privilege_values: "{{ (privilege_list if (privilege_list is iterable and privilege_list is not string) else privilege_list.split(',')) | map('trim') | list }}"
+          block:
+            - assert:
+                that:
+                  - user_password_trimmed | length > 0
+                fail_msg: >-
+                  Passwords referenced by mariadb_schemas for user {{ user.name }} in schema {{ schema_item.name }} must resolve to non-empty values. Verify the password/password_var entries.
+
+            - set_fact:
+                mariadb_current_schema_users: "{{ mariadb_current_schema_users + [ {
+                  'name': user.name,
+                  'password': user_password_trimmed,
+                  'privileges': privilege_values,
+                  'grant_option': grant_option_flag | bool
+                } ] }}"
+          loop: "{{ schema_item.users }}"
+          loop_control:
+            loop_var: user
+            label: "{{ user.name }}"
+          no_log: true
+
+        - set_fact:
+            mariadb_resolved_schemas: "{{ (mariadb_resolved_schemas | default([])) + [ {
+              'name': schema_item.name,
+              'state': schema_state,
+              'users': mariadb_current_schema_users
+            } ] }}"
       loop: "{{ mariadb_schemas }}"
       loop_control:
         label: "{{ item.name }}"
-      no_log: true
 
-    - name: Ensure schema passwords are populated
-      assert:
-        that:
-          - item.password | length > 0
-        fail_msg: >-
-          Passwords referenced by mariadb_schemas must resolve to non-empty values. Verify the password/password_var entries.
-      loop: "{{ mariadb_resolved_schemas }}"
-      loop_control:
-        label: "{{ item.name }}"
+- name: Partition schemas by desired state
+  when: (mariadb_resolved_schemas | length) > 0
+  set_fact:
+    mariadb_present_schemas: "{{ mariadb_resolved_schemas | selectattr('state', 'equalto', 'present') | list }}"
+    mariadb_absent_schemas: "{{ mariadb_resolved_schemas | selectattr('state', 'equalto', 'absent') | list }}"
 
 - name: Determine target runtimes
   vars:
@@ -173,6 +259,21 @@
          | list
          | unique }}
 
+- name: Query existing root account hosts
+  community.mysql.mysql_query:
+    query: "SELECT host FROM mysql.user WHERE user = 'root'"
+    login_host: "{{ mariadb_admin_host }}"
+    login_port: "{{ mariadb_service_port }}"
+    login_user: root
+    login_password: "{{ mariadb_root_password }}"
+  register: mariadb_root_host_query
+  changed_when: false
+  no_log: true
+
+- name: Normalize existing root hosts
+  set_fact:
+    mariadb_root_existing_hosts: "{{ (mariadb_root_host_query.query_result | default([])) | map(attribute='rows') | list | flatten }}"
+
 - name: Ensure root accounts are scoped to approved hosts
   when: (mariadb_root_allowed_hosts_resolved | length) > 0
   community.mysql.mysql_user:
@@ -193,8 +294,8 @@
 
 - name: Remove remote root accounts
   vars:
-    mariadb_root_hosts_to_remove: "{{ mariadb_root_disallowed_hosts_resolved
-      | difference(mariadb_root_allowed_hosts_resolved) }}"
+    mariadb_root_hosts_to_remove: "{{ (mariadb_root_disallowed_hosts_resolved | difference(mariadb_root_allowed_hosts_resolved))
+      | intersect(mariadb_root_existing_hosts | default([])) }}"
   when: (mariadb_root_hosts_to_remove | length) > 0
   community.mysql.mysql_user:
     name: root
@@ -209,18 +310,39 @@
     label: "root@{{ item }}"
   no_log: true
 
-- name: Remove default test database
+- name: Discover default test schemas
   when: mariadb_remove_test_database | bool
+  community.mysql.mysql_query:
+    query: "SHOW DATABASES LIKE 'test%'"
+    login_host: "{{ mariadb_admin_host }}"
+    login_port: "{{ mariadb_service_port }}"
+    login_user: root
+    login_password: "{{ mariadb_root_password }}"
+  register: mariadb_test_database_query
+  changed_when: false
+
+- name: Normalize test schemas slated for removal
+  when: mariadb_remove_test_database | bool
+  set_fact:
+    mariadb_test_databases: "{{ (mariadb_test_database_query.query_result | default([])) | map(attribute='rows') | list | flatten }}"
+
+- name: Remove default test databases
+  when:
+    - mariadb_remove_test_database | bool
+    - (mariadb_test_databases | default([])) | length > 0
   community.mysql.mysql_db:
-    name: test
+    name: "{{ item }}"
     state: absent
     login_host: "{{ mariadb_admin_host }}"
     login_port: "{{ mariadb_service_port }}"
     login_user: root
     login_password: "{{ mariadb_root_password }}"
+  loop: "{{ mariadb_test_databases }}"
+  loop_control:
+    label: "{{ item }}"
 
 - name: Ensure requested schemas exist
-  when: (mariadb_resolved_schemas | length) > 0
+  when: (mariadb_present_schemas | default([])) | length > 0
   community.mysql.mysql_db:
     name: "{{ item.name }}"
     state: present
@@ -230,49 +352,131 @@
     login_port: "{{ mariadb_service_port }}"
     login_user: root
     login_password: "{{ mariadb_root_password }}"
-  loop: "{{ mariadb_resolved_schemas }}"
+  loop: "{{ mariadb_present_schemas }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Drop schemas marked absent
+  when: (mariadb_absent_schemas | default([])) | length > 0
+  community.mysql.mysql_db:
+    name: "{{ item.name }}"
+    state: absent
+    login_host: "{{ mariadb_admin_host }}"
+    login_port: "{{ mariadb_service_port }}"
+    login_user: root
+    login_password: "{{ mariadb_root_password }}"
+  loop: "{{ mariadb_absent_schemas }}"
   loop_control:
     label: "{{ item.name }}"
 
 - name: Ensure schema users exist with scoped privileges
-  when: (mariadb_resolved_schemas | length) > 0
+  when: (mariadb_present_schemas | default([])) | length > 0
+  vars:
+    schema_item: "{{ item.0 }}"
+    user_item: "{{ item.1 }}"
+    privilege_list: "{{ user_item.privileges | unique }}"
+    privilege_clause: "{{ privilege_list | join(',') }}{{ ',GRANT' if user_item.grant_option | bool else '' }}"
   community.mysql.mysql_user:
-    name: "{{ item.user }}"
-    password: "{{ item.password }}"
+    name: "{{ user_item.name }}"
+    password: "{{ user_item.password }}"
     host: "%"
     state: present
-    priv: "{{ item.name }}.*:ALL"
+    priv: "{{ schema_item.name }}.*:{{ privilege_clause }}"
     login_host: "{{ mariadb_admin_host }}"
     login_port: "{{ mariadb_service_port }}"
     login_user: root
     login_password: "{{ mariadb_root_password }}"
     update_password: always
-  loop: "{{ mariadb_resolved_schemas }}"
+  loop: "{{ mariadb_present_schemas | subelements('users') }}"
   loop_control:
-    label: "{{ item.user }}@{{ item.name }}"
+    label: "{{ user_item.name }}@{{ schema_item.name }}"
+  no_log: true
+
+- name: Remove users for dropped schemas
+  when: (mariadb_absent_schemas | default([])) | length > 0
+  vars:
+    schema_item: "{{ item.0 }}"
+    user_item: "{{ item.1 }}"
+  community.mysql.mysql_user:
+    name: "{{ user_item.name }}"
+    host: "%"
+    state: absent
+    login_host: "{{ mariadb_admin_host }}"
+    login_port: "{{ mariadb_service_port }}"
+    login_user: root
+    login_password: "{{ mariadb_root_password }}"
+  loop: "{{ mariadb_absent_schemas | subelements('users') }}"
+  loop_control:
+    label: "{{ user_item.name }}@{{ schema_item.name }}"
   no_log: true
 
 - name: Ensure schema export directory exists
-  when: (mariadb_resolved_schemas | length) > 0
   file:
     path: "{{ mariadb_exports_directory }}"
     state: directory
-    owner: root
-    group: root
-    mode: "0750"
+    owner: "{{ mariadb_exports_owner }}"
+    group: "{{ mariadb_exports_group }}"
+    mode: "{{ mariadb_exports_directory_mode }}"
+
+- name: Initialize expected schema exports
+  when: (mariadb_present_schemas | default([])) | length > 0
+  set_fact:
+    mariadb_expected_exports: []
+
+- name: Build schema export manifest
+  when: (mariadb_present_schemas | default([])) | length > 0
+  vars:
+    schema_item: "{{ item.0 }}"
+    user_item: "{{ item.1 }}"
+    schema_safe: "{{ schema_item.name | regex_replace('[^A-Za-z0-9_.-]', '_') }}"
+    user_safe: "{{ user_item.name | regex_replace('[^A-Za-z0-9_.-]', '_') }}"
+    export_filename: "{{ service_id }}-{{ schema_safe }}-{{ user_safe }}.env"
+    export_path: "{{ [mariadb_exports_directory, export_filename] | path_join }}"
+  set_fact:
+    mariadb_expected_exports: "{{ mariadb_expected_exports + [ {
+      'schema': schema_item.name,
+      'user': user_item.name,
+      'password': user_item.password,
+      'path': export_path
+    } ] }}"
+  loop: "{{ mariadb_present_schemas | subelements('users') }}"
+  loop_control:
+    label: "{{ user_item.name }}@{{ schema_item.name }}"
+  no_log: true
 
 - name: Render per-schema export files
-  when: (mariadb_resolved_schemas | length) > 0
+  when: (mariadb_expected_exports | default([])) | length > 0
   copy:
-    dest: "{{ [mariadb_exports_directory, item.name ~ '.env'] | path_join }}"
+    dest: "{{ item.path }}"
     content: |-
       DATABASE_HOST={{ service_ip }}
       DATABASE_PORT={{ mariadb_service_port }}
-      DATABASE_NAME={{ item.name }}
+      DATABASE_NAME={{ item.schema }}
       DATABASE_USER={{ item.user }}
-    owner: root
-    group: root
-    mode: "0640"
-  loop: "{{ mariadb_resolved_schemas }}"
+      {% if mariadb_exports_include_credentials %}DATABASE_PASSWORD={{ item.password }}
+      {% endif %}DATABASE_VERSION={{ version }}
+    owner: "{{ mariadb_exports_owner }}"
+    group: "{{ mariadb_exports_group }}"
+    mode: "{{ mariadb_exports_file_mode }}"
+  loop: "{{ mariadb_expected_exports }}"
   loop_control:
-    label: "{{ item.name }}"
+    label: "{{ item.user }}@{{ item.schema }}"
+  no_log: true
+
+- name: Remove orphaned schema export files
+  find:
+    paths: "{{ mariadb_exports_directory }}"
+    patterns: "{{ service_id }}-*.env"
+    file_type: file
+  register: mariadb_existing_export_files
+
+- name: Prune stale schema exports
+  vars:
+    expected_paths: "{{ mariadb_expected_exports | default([]) | map(attribute='path') | list }}"
+  file:
+    path: "{{ item.path }}"
+    state: absent
+  when: item.path not in expected_paths
+  loop: "{{ mariadb_existing_export_files.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
