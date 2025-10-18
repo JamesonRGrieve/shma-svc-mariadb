@@ -3,6 +3,53 @@
   include_role:
     name: common.validate_schema
 
+- name: Ensure MariaDB secrets are overridden
+  vars:
+    mariadb_default_passwords:
+      - change-me-root
+      - change-me-user
+  assert:
+    that:
+      - mariadb_root_password is defined
+      - mariadb_user_password is defined
+      - mariadb_root_password | length > 0
+      - mariadb_user_password | length > 0
+      - mariadb_root_password not in mariadb_default_passwords
+      - mariadb_user_password not in mariadb_default_passwords
+    fail_msg: >-
+      MariaDB root/user credentials must be provided via secrets or vault entries; the default placeholders are insecure.
+
+- name: Validate backup credentials when logical backups are enabled
+  when: mariadb_backups.logical.enabled | bool
+  vars:
+    mariadb_backup_placeholder_values:
+      - change-me-restic
+      - change-me-access-key
+      - change-me-secret
+      - s3:s3.amazonaws.com/example-bucket/mariadb
+  assert:
+    that:
+      - mariadb_backup_restic_repository is defined
+      - mariadb_backup_restic_password is defined
+      - mariadb_backup_aws_access_key_id is defined
+      - mariadb_backup_aws_secret_access_key is defined
+      - mariadb_backup_restic_repository not in mariadb_backup_placeholder_values
+      - mariadb_backup_restic_password not in mariadb_backup_placeholder_values
+      - mariadb_backup_aws_access_key_id not in mariadb_backup_placeholder_values
+      - mariadb_backup_aws_secret_access_key not in mariadb_backup_placeholder_values
+    fail_msg: >-
+      Restic repository credentials must be stored in secrets (e.g. Vault or Kubernetes Secret) and cannot use the provided placeholders.
+
+- name: Validate binlog shipping configuration
+  when: mariadb_backups.binlog_shipping.enabled | bool
+  assert:
+    that:
+      - mariadb_binlog_s3_path is defined
+      - mariadb_binlog_s3_path | length > 0
+      - mariadb_binlog_s3_path != 's3://example-bucket/mariadb/binlog'
+    fail_msg: >-
+      Configure a production S3 path for binlog shipping to guarantee point-in-time recovery.
+
 - name: Determine target runtimes
   vars:
     candidate_runtimes: "{{ runtime | default(target_runtimes | default(runtime_templates.keys() | list)) }}"
