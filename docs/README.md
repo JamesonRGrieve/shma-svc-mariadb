@@ -52,6 +52,7 @@ All secrets must be provided through inventory, Vault, or an external secret man
 - Container runtimes attach the database to a dedicated internal bridge network (`mariadb_internal_network`) that is not exposed publicly.
 - `service_firewall` seeds iptables and Proxmox firewall rules that only permit RFC1918 source CIDRs by default (`mariadb_allowed_cidrs`); tailor to your private address space.
 - Kubernetes runtimes render a `ClusterIP` Service alongside a restrictive `NetworkPolicy` that limits ingress to in-namespace workloads unless overridden.
+- Post-deploy tasks scope the `root` account to loopback and automation hosts, remove remote wildcards, and drop the default `test` schema to eliminate insecure defaults.
 
 ### Backups & PITR
 - `mariadb_backups.logical` enables nightly `mysqldump` exports that are piped into Restic for deduplicated storage in object stores (S3, MinIO, etc.). Adjust the cron `schedule` and retention knobs as needed.
@@ -79,6 +80,11 @@ All secrets must be provided through inventory, Vault, or an external secret man
 | `mariadb_container_cpu_cores` | `2` | CPU allocation across runtimes |
 | `mariadb_container_memory_mb` | `2048` | Memory allocation across runtimes |
 | `mariadb_allowed_cidrs` | RFC1918 ranges | Sources allowed through firewall policy |
+| `mariadb_innodb_buffer_pool_size` | `256M` | Buffer pool size exposed via `MARIADB_EXTRA_FLAGS` |
+| `mariadb_max_connections` | `151` | Connection limit exposed via `MARIADB_EXTRA_FLAGS` |
+| `mariadb_root_allowed_hosts` | `localhost`, `127.0.0.1`, `::1`, admin IPs | Root account scope for automation |
+| `mariadb_root_disallowed_hosts` | `%` | Remote root hosts removed after bootstrap |
+| `mariadb_remove_test_database` | `true` | Drop default `test` schema post-deploy |
 | `mariadb_backups.logical.schedule` | `0 2 * * *` | Nightly logical dump cadence |
 | `mariadb_backups.binlog_shipping.retention_hours` | `168` | Retention for shipped binary logs |
 | `mariadb_kubernetes_namespace` | `databases` | Namespace for Deployment/Service/PVC |
