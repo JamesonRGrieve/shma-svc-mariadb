@@ -65,7 +65,6 @@ service_container:
   interface: "{{ mariadb_container_interface }}"
   onboot: yes
   unprivileged: yes
-  features: nesting=1,keyctl=1
 requires: []
 exports:
   env:
@@ -135,6 +134,9 @@ mariadb_service_port: 3306
 mariadb_database: appdb
 mariadb_user: app
 mariadb_data_volume: mariadb-data
+mariadb_admin_host: "{{ service_ip }}"
+mariadb_schemas: []
+mariadb_exports_directory: /srv/db/exports
 mariadb_container_vmid: 200
 mariadb_container_ip: 192.168.100.10
 mariadb_container_gateway: 192.168.100.1

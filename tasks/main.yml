@@ -50,6 +50,58 @@
     fail_msg: >-
       Configure a production S3 path for binlog shipping to guarantee point-in-time recovery.
 
+- name: Initialize resolved schema definitions
+  set_fact:
+    mariadb_resolved_schemas: []
+
+- name: Validate multi-schema configuration
+  when: (mariadb_schemas | length) > 0
+  block:
+    - name: Ensure schema definitions declare name, user, and credentials
+      assert:
+        that:
+          - item.name is defined
+          - item.name | length > 0
+          - item.user is defined
+          - item.user | length > 0
+          - (item.password is defined) or (item.password_var is defined)
+        fail_msg: >-
+          Each entry in mariadb_schemas must provide name, user, and either password or password_var.
+      loop: "{{ mariadb_schemas }}"
+      loop_control:
+        label: "{{ item.name | default('unnamed') }}"
+
+    - name: Resolve schema credentials
+      vars:
+        schema_password_var: "{{ item.password_var | default(None) }}"
+        schema_password: >-
+          {% if item.password is defined %}
+          {{ item.password }}
+          {% elif schema_password_var is not none %}
+          {{ lookup('vars', schema_password_var, default='') }}
+          {% else %}
+          {% endif %}
+      set_fact:
+        mariadb_resolved_schemas: "{{ (mariadb_resolved_schemas | default([])) + [ {
+          'name': item.name,
+          'user': item.user,
+          'password': schema_password | trim
+        } ] }}"
+      loop: "{{ mariadb_schemas }}"
+      loop_control:
+        label: "{{ item.name }}"
+      no_log: true
+
+    - name: Ensure schema passwords are populated
+      assert:
+        that:
+          - item.password | length > 0
+        fail_msg: >-
+          Passwords referenced by mariadb_schemas must resolve to non-empty values. Verify the password/password_var entries.
+      loop: "{{ mariadb_resolved_schemas }}"
+      loop_control:
+        label: "{{ item.name }}"
+
 - name: Determine target runtimes
   vars:
     candidate_runtimes: "{{ runtime | default(target_runtimes | default(runtime_templates.keys() | list)) }}"
@@ -94,3 +146,73 @@
         name: common.apply_runtime
       vars:
         runtime: "{{ runtime_item }}"
+
+- name: Wait for MariaDB to accept connections for schema provisioning
+  when: (mariadb_resolved_schemas | length) > 0
+  community.mysql.mysql_ping:
+    login_host: "{{ mariadb_admin_host }}"
+    login_port: "{{ mariadb_service_port }}"
+    login_user: root
+    login_password: "{{ mariadb_root_password }}"
+  register: mariadb_ping_result
+  retries: 10
+  delay: 6
+  until: mariadb_ping_result is succeeded
+
+- name: Ensure requested schemas exist
+  when: (mariadb_resolved_schemas | length) > 0
+  community.mysql.mysql_db:
+    name: "{{ item.name }}"
+    state: present
+    encoding: utf8mb4
+    collation: utf8mb4_unicode_ci
+    login_host: "{{ mariadb_admin_host }}"
+    login_port: "{{ mariadb_service_port }}"
+    login_user: root
+    login_password: "{{ mariadb_root_password }}"
+  loop: "{{ mariadb_resolved_schemas }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Ensure schema users exist with scoped privileges
+  when: (mariadb_resolved_schemas | length) > 0
+  community.mysql.mysql_user:
+    name: "{{ item.user }}"
+    password: "{{ item.password }}"
+    host: "%"
+    state: present
+    priv: "{{ item.name }}.*:ALL"
+    login_host: "{{ mariadb_admin_host }}"
+    login_port: "{{ mariadb_service_port }}"
+    login_user: root
+    login_password: "{{ mariadb_root_password }}"
+    update_password: always
+  loop: "{{ mariadb_resolved_schemas }}"
+  loop_control:
+    label: "{{ item.user }}@{{ item.name }}"
+  no_log: true
+
+- name: Ensure schema export directory exists
+  when: (mariadb_resolved_schemas | length) > 0
+  file:
+    path: "{{ mariadb_exports_directory }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Render per-schema export files
+  when: (mariadb_resolved_schemas | length) > 0
+  copy:
+    dest: "{{ [mariadb_exports_directory, item.name ~ '.env'] | path_join }}"
+    content: |-
+      DATABASE_HOST={{ service_ip }}
+      DATABASE_PORT={{ mariadb_service_port }}
+      DATABASE_NAME={{ item.name }}
+      DATABASE_USER={{ item.user }}
+    owner: root
+    group: root
+    mode: "0640"
+  loop: "{{ mariadb_resolved_schemas }}"
+  loop_control:
+    label: "{{ item.name }}"
