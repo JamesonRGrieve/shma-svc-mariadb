@@ -13,6 +13,12 @@ service_env:
     value: "{{ mariadb_database }}"
   - name: MYSQL_USER
     value: "{{ mariadb_user }}"
+  - name: MARIADB_EXTRA_FLAGS
+    value: >-
+      {{ [
+        '--innodb-buffer-pool-size=' ~ mariadb_innodb_buffer_pool_size,
+        '--max-connections=' ~ (mariadb_max_connections | string)
+      ] | join(' ') }}
 service_networks:
   - name: "{{ mariadb_internal_network }}"
     driver: bridge
@@ -158,6 +164,17 @@ mariadb_allowed_cidrs:
   - 10.0.0.0/8
   - 172.16.0.0/12
   - 192.168.0.0/16
+mariadb_innodb_buffer_pool_size: 256M
+mariadb_max_connections: 151
+mariadb_root_allowed_hosts:
+  - localhost
+  - 127.0.0.1
+  - ::1
+  - "{{ mariadb_admin_host }}"
+  - "{{ ansible_default_ipv4.address | default(None) }}"
+mariadb_root_disallowed_hosts:
+  - "%"
+mariadb_remove_test_database: true
 mariadb_backups:
   logical:
     enabled: true

@@ -147,8 +147,7 @@
       vars:
         runtime: "{{ runtime_item }}"
 
-- name: Wait for MariaDB to accept connections for schema provisioning
-  when: (mariadb_resolved_schemas | length) > 0
+- name: Wait for MariaDB to accept connections
   community.mysql.mysql_ping:
     login_host: "{{ mariadb_admin_host }}"
     login_port: "{{ mariadb_service_port }}"
@@ -158,6 +157,67 @@
   retries: 10
   delay: 6
   until: mariadb_ping_result is succeeded
+
+- name: Normalize root host allow and deny lists
+  set_fact:
+    mariadb_root_allowed_hosts_resolved: >-
+      {{ (mariadb_root_allowed_hosts | default([]))
+         | reject('equalto', None)
+         | reject('equalto', '')
+         | list
+         | unique }}
+    mariadb_root_disallowed_hosts_resolved: >-
+      {{ (mariadb_root_disallowed_hosts | default([]))
+         | reject('equalto', None)
+         | reject('equalto', '')
+         | list
+         | unique }}
+
+- name: Ensure root accounts are scoped to approved hosts
+  when: (mariadb_root_allowed_hosts_resolved | length) > 0
+  community.mysql.mysql_user:
+    name: root
+    host: "{{ item }}"
+    password: "{{ mariadb_root_password }}"
+    priv: "*.*:ALL,GRANT"
+    state: present
+    update_password: always
+    login_host: "{{ mariadb_admin_host }}"
+    login_port: "{{ mariadb_service_port }}"
+    login_user: root
+    login_password: "{{ mariadb_root_password }}"
+  loop: "{{ mariadb_root_allowed_hosts_resolved }}"
+  loop_control:
+    label: "root@{{ item }}"
+  no_log: true
+
+- name: Remove remote root accounts
+  vars:
+    mariadb_root_hosts_to_remove: "{{ mariadb_root_disallowed_hosts_resolved
+      | difference(mariadb_root_allowed_hosts_resolved) }}"
+  when: (mariadb_root_hosts_to_remove | length) > 0
+  community.mysql.mysql_user:
+    name: root
+    host: "{{ item }}"
+    state: absent
+    login_host: "{{ mariadb_admin_host }}"
+    login_port: "{{ mariadb_service_port }}"
+    login_user: root
+    login_password: "{{ mariadb_root_password }}"
+  loop: "{{ mariadb_root_hosts_to_remove }}"
+  loop_control:
+    label: "root@{{ item }}"
+  no_log: true
+
+- name: Remove default test database
+  when: mariadb_remove_test_database | bool
+  community.mysql.mysql_db:
+    name: test
+    state: absent
+    login_host: "{{ mariadb_admin_host }}"
+    login_port: "{{ mariadb_service_port }}"
+    login_user: root
+    login_password: "{{ mariadb_root_password }}"
 
 - name: Ensure requested schemas exist
   when: (mariadb_resolved_schemas | length) > 0
