@@ -1,0 +1,60 @@
+$schema: "http://json-schema.org/draft-07/schema#"
+title: svc-mariadb contract
+$defs:
+  schema_user:
+    type: object
+    additionalProperties: true
+    required:
+      - name
+    properties:
+      name:
+        type: string
+        minLength: 1
+      privilege_level:
+        type: string
+        enum: [standard, read_only, with_grant_option]
+      privileges:
+        oneOf:
+          - type: array
+            minItems: 1
+            items:
+              type: string
+              minLength: 1
+          - type: string
+            minLength: 1
+      password:
+        type: string
+        minLength: 1
+      password_var:
+        type: string
+        minLength: 1
+    anyOf:
+      - required: [password]
+      - required: [password_var]
+  schema_entry:
+    type: object
+    additionalProperties: true
+    required:
+      - name
+      - users
+    properties:
+      name:
+        type: string
+        minLength: 1
+        not:
+          enum: [information_schema, mysql, performance_schema, sys]
+      state:
+        type: string
+        enum: [present, absent]
+      users:
+        type: array
+        minItems: 1
+        items:
+          $ref: "#/$defs/schema_user"
+type: object
+additionalProperties: true
+properties:
+  mariadb_schemas:
+    type: array
+    items:
+      $ref: "#/$defs/schema_entry"

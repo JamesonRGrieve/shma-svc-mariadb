@@ -13,14 +13,18 @@ Declarative service contract for MariaDB 10.11 aligned with the shared infrastru
 - Global environment exports retain backwards compatibility for single-tenant consumers and now
   include the server version. Set `mariadb_exports_include_credentials: true` in trusted
   environments to append `DATABASE_PASSWORD` to the rendered secret bundle.
-- Per-schema exports are rendered to
-  `{{ mariadb_exports_directory }}/{{ service_id }}-<schema>-<user>.env`. Each file advertises the
-  host, port, schema, user, and version; passwords are included only when
-  `mariadb_exports_include_credentials` is enabled. Export directory ownership and permissions can
-  be tuned via `mariadb_exports_owner`, `mariadb_exports_group`, `mariadb_exports_directory_mode`,
-  and `mariadb_exports_file_mode`.
-- Stale export files are automatically pruned when schemas or users are removed from the contract,
-  preventing consumers from sourcing credentials that no longer exist.
+- Per-schema exports are now generated in-memory so container images remain immutable. The default
+  `mariadb_exports_delivery: stdout` streams deterministic key/content pairs (one per schema user)
+  to the play output for operators that capture stdout.
+- Set `mariadb_exports_delivery: configmap` to fold the per-user exports into
+  `exports.configmaps` using `mariadb_exports_configmap_name`, or
+  `mariadb_exports_delivery: secret` to publish them under `exports.secrets` via
+  `mariadb_exports_secret_name`.
+- Export keys include a SHA-256 hash suffix to avoid collisions between sanitized schema/user
+  names and eliminate races with concurrent deployments—no on-host pruning is required.
+- When `mariadb_exports_include_credentials` is enabled, prefer the `secret` delivery mode or
+  distribute passwords through Vault / sealed secrets to avoid storing credentials in plaintext
+  ConfigMaps.
 
 ### Multi-tenant Schemas
 Define additional databases with the `mariadb_schemas` list. Each item provides a schema name,
@@ -45,10 +49,12 @@ mariadb_schemas:
 
 Reserved system schemas such as `mysql`, `information_schema`, `performance_schema`, and `sys` are
 rejected. Privilege levels default to full DDL/DML access, can be set to `read_only`, or extended by
-supplying an explicit list of privileges. Setting `state: absent` drops both the schema and any
-users declared for it. The role waits for MariaDB to become reachable, creates the requested
-schemas and scoped users, and renders export files for each user. Existing `mariadb_database` /
-`mariadb_user` variables remain available for simple single-tenant deployments.
+supplying an explicit list of privileges. Validation now happens via a custom Jinja filter so
+mistakes surface during `ansible-playbook --check`. Setting `state: absent` drops both the schema and
+declared users immediately—take ad-hoc dumps before toggling the state if data must be retained. The
+role waits for MariaDB to become reachable, creates the requested schemas and scoped users, and
+streams export entries for each user. Existing `mariadb_database` / `mariadb_user` variables remain
+available for simple single-tenant deployments.
 
 ### Secrets
 - `MYSQL_ROOT_PASSWORD` -> root account password
@@ -56,6 +62,8 @@ schemas and scoped users, and renders export files for each user. Existing `mari
 - `RESTIC_PASSWORD` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` -> credentials for the automated Restic backup jobs
 
 All secrets must be provided through inventory, Vault, or an external secret manager. The role asserts that the placeholder defaults are never used at runtime.
+Root and application credentials must be at least 16 characters long and include mixed case, digits,
+and special characters.
 
 ### Security & Networking
 - Host publishing of TCP/3306 remains disabled by default (`mariadb_publish_port: false`). If a host
@@ -65,10 +73,10 @@ All secrets must be provided through inventory, Vault, or an external secret man
   (`mariadb_internal_network`) that is not exposed publicly. Kubernetes runtimes render a
   `ClusterIP` Service alongside a restrictive `NetworkPolicy` that limits ingress to in-namespace
   workloads unless overridden.
-- Post-deploy tasks scope the `root` account to loopback (`localhost`, `127.0.0.1`, `::1`) and remove
-  wildcard entries only when they exist, eliminating unnecessary churn. For one-time remote
-  maintenance, forward the socket over SSH instead of relaxing host grants:
-  1. `ssh -L 13306:127.0.0.1:{{ mariadb_service_port }} admin@database-host`
+- Post-deploy tasks enforce a strict whitelist for the `root` account. Any `root@host` entries not in
+  `mariadb_root_allowed_hosts` are removed automatically. For one-time remote maintenance, forward the
+  socket over SSH instead of relaxing host grants:
+  1. `ssh -i ~/.ssh/admin_id -J bastion@example.com -L 13306:127.0.0.1:{{ mariadb_service_port }} mariadb-admin@database-host`
   2. Connect with your local client against `127.0.0.1:13306` using the root credentials.
   3. Close the tunnel when finished; no server-side configuration changes are required.
 - Default server configuration enforces `{{ mariadb_character_set }}` / `{{ mariadb_collation }}` and
@@ -78,33 +86,42 @@ All secrets must be provided through inventory, Vault, or an external secret man
 - The bundled health check script (see below) optionally notifies an external webhook when failures
   occur. Provide `mariadb_health_webhook_url` to receive JSON alerts from the health probe.
 
+The wait task leverages `community.mysql.mysql_ping`, which requires `PyMySQL` to be installed on the
+control node. Install `python3-pymysql` (or the equivalent package for your platform) before running
+the role, or swap the module for a shell-based `mysqladmin ping` check if that dependency is
+undesirable.
+
 ### Backups & PITR
 - `mariadb_backups.logical` enables nightly `mysqldump` exports that are piped into Restic for
-  deduplicated storage in object stores (S3, MinIO, etc.). System schemas are now excluded by
-  default via `extra_args` to keep dump sizes lean. Set
-  `mariadb_backups.logical.verify_repository: true` to run `restic snapshots --repo ...` during the
-  play to confirm credentials and repository access before scheduling the cron job. Retention knobs
-  must satisfy `keep_monthly >= keep_weekly >= keep_daily`; the role enforces this relationship.
+  deduplicated storage in object stores (S3, MinIO, etc.). System schemas are excluded by default via
+  `extra_args` to keep dump sizes lean.
+- Run the optional repository verification with `ansible-playbook ... --tags verify-backups`; the
+  Restic preflight is no longer gated by a boolean variable. Retention knobs must satisfy
+  `keep_monthly >= keep_weekly >= keep_daily`. Changing this hierarchy later requires manual
+  pruning of existing snapshots to avoid lingering data in higher retention tiers.
 - Populate `RESTIC_PASSWORD`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY` secrets to
   authenticate to the Restic repository specified via `mariadb_backup_restic_repository`.
-- `mariadb_backups.binlog_shipping` streams MariaDB binary logs to S3 for point-in-time recovery and
-  now records an MD5 checksum alongside each upload when `checksum: md5` (the default) is enabled.
-  Adjust the S3 path and retention per compliance needs.
+- `mariadb_backups.binlog_shipping` now uploads a lightweight preflight object to the configured S3
+  bucket to confirm write access before streaming binary logs. The helper respects
+  `mariadb_backup_aws_region` when provided and deletes the probe object afterwards. Checksums remain
+  enabled via `checksum: md5` by default.
 
 ### Health Check
-Runtimes execute `{{ mariadb_health_check_script }}` every 10 seconds with a 5 second timeout. The
-script performs several layered validations:
+Runtimes execute `{{ mariadb_health_check_script }}`—sourced from `files/mariadb-healthcheck.sh`—every
+10 seconds with a 5 second timeout. The script performs several layered validations:
 
 1. `mysqladmin ping` verifies that the server is responsive on `127.0.0.1:{{ mariadb_service_port }}`.
 2. `SHOW GLOBAL STATUS LIKE 'Threads_connected'` fails the probe when connection usage exceeds the
-   configured `mariadb_max_connections` or crosses the derived
-   `mariadb_health_connection_threshold_count` (90% by default).
+   configured `max_connections` or crosses the derived
+   `mariadb_health_connection_threshold_count` (90% by default), passed in via
+   `MARIADB_HEALTH_CONNECTION_THRESHOLD`.
 3. `df` monitors `/var/lib/mysql` and trips when disk utilization breaches
    `mariadb_health_disk_usage_threshold` (90% by default).
 4. When `mariadb_replication_enabled: true`, the probe inspects `SHOW REPLICA STATUS` /
    `SHOW SLAVE STATUS` to ensure the IO and SQL threads are both running.
-5. Failures optionally trigger a JSON webhook POST to `mariadb_health_webhook_url`, allowing external
-   monitoring systems to alert operators.
+5. Failures optionally trigger a JSON webhook POST to `mariadb_health_webhook_url`. The helper retries
+   delivery a few times but ultimately treats notifications as best-effort so an unreachable webhook
+   does not mask database issues.
 
 The script prints `ok` on success and exits non-zero on any failure, feeding Docker, Podman, and
 Kubernetes liveness/readiness gates.
@@ -138,8 +155,10 @@ Document the chosen procedure in runbooks so operators do not rely on disruptive
 | `mariadb_user` | `app` | Application database user |
 | `mariadb_schemas` | `[]` | Declarative schema list (supports per-user privileges and `state`) |
 | `mariadb_admin_host` | `{{ service_ip }}` | Hostname/IP used for administrative connections |
-| `mariadb_exports_directory` | `/srv/db/exports` | Directory for per-user export files |
-| `mariadb_exports_include_credentials` | `false` | Include `DATABASE_PASSWORD` in exports when true |
+| `mariadb_exports_delivery` | `stdout` | Delivery target for per-user exports (`stdout` / `configmap` / `secret` / `none`) |
+| `mariadb_exports_configmap_name` | `{{ service_id }}-schema-exports` | ConfigMap name when `mariadb_exports_delivery: configmap` |
+| `mariadb_exports_secret_name` | `{{ service_id }}-schema-exports` | Secret name when `mariadb_exports_delivery: secret` |
+| `mariadb_exports_include_credentials` | `false` | Include `DATABASE_PASSWORD` in exports when true (prefer `secret` delivery or Vault) |
 | `mariadb_data_volume` | `mariadb-data` | Named volume for container targets |
 | `mariadb_allowed_cidrs` | *(required)* | Firewall source CIDRs; must be set per deployment |
 | `mariadb_character_set` / `mariadb_collation` | `utf8mb4` / `utf8mb4_unicode_ci` | Server character set & collation |
@@ -152,8 +171,9 @@ Document the chosen procedure in runbooks so operators do not rely on disruptive
 | `mariadb_root_allowed_hosts` | `localhost`, `127.0.0.1`, `::1` | Loopback-only root access |
 | `mariadb_remove_test_database` | `true` | Drop default `test%` schemas post-deploy |
 | `mariadb_backups.logical.schedule` | `0 2 * * *` | Nightly logical dump cadence |
-| `mariadb_backups.logical.verify_repository` | `true` | Run `restic snapshots` to validate access |
+| `mariadb_backups.logical.verify_repository` | `true` | Legacy knob retained for compatibility; use `--tags verify-backups` to run `restic snapshots` |
 | `mariadb_backups.binlog_shipping.checksum` | `md5` | Upload checksum for each shipped binlog |
+| `mariadb_backup_aws_region` | *unset* | Optional AWS region for binlog shipping and Restic uploads |
 | `mariadb_health_disk_usage_threshold` | `90` | Disk utilization percentage that fails health checks |
 | `mariadb_health_connection_utilization_threshold` | `0.9` | Fraction of `max_connections` that trips alerts |
 | `mariadb_health_webhook_url` | `""` | Optional webhook notified on health-check failure |
