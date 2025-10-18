@@ -6,19 +6,38 @@ version: "10.11"
 service_ip: "{{ mariadb_container_ip }}"
 service_ports:
   - target: 3306
-    published: {{ mariadb_service_port }}
     protocol: tcp
+    published: "{{ mariadb_service_port if mariadb_publish_port else omit }}"
 service_env:
   - name: MYSQL_DATABASE
     value: "{{ mariadb_database }}"
   - name: MYSQL_USER
     value: "{{ mariadb_user }}"
+service_networks:
+  - name: "{{ mariadb_internal_network }}"
+    driver: bridge
+    internal: true
+    attachable: false
 service_volumes:
   - name: data
     source: "{{ mariadb_data_volume }}"
     target: /var/lib/mysql
     driver: local
     size: "{{ mariadb_container_storage_gb }}Gi"
+service_firewall:
+  iptables:
+    inbound:
+      - proto: tcp
+        port: "{{ mariadb_service_port }}"
+        sources: {{ mariadb_allowed_cidrs }}
+  proxmox:
+    enable: true
+    policy: drop
+    inbound:
+      - action: ACCEPT
+        proto: tcp
+        port: "{{ mariadb_service_port }}"
+        sources: {{ mariadb_allowed_cidrs }}
 service_resources:
   memory_mb: "{{ mariadb_container_memory_mb }}"
   cpu_cores: "{{ mariadb_container_cpu_cores }}"
@@ -73,6 +92,26 @@ health:
   interval: 10s
   timeout: 5s
   retries: 5
+  start_period: 30s
+  success_threshold: 1
+  failure_threshold: 3
+kubernetes:
+  service:
+    type: ClusterIP
+  network_policy:
+    enabled: true
+    pod_selector:
+      matchLabels:
+        app.kubernetes.io/name: "{{ service_name }}"
+    ingress:
+      - ports:
+          - protocol: TCP
+            port: {{ mariadb_service_port }}
+        from:
+          - podSelector: {}
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: "{{ mariadb_kubernetes_namespace }}"
 runtime_templates:
   proxmox: proxmox.yml.j2
   docker: docker.yml.j2
@@ -85,6 +124,12 @@ secrets:
       value: "{{ mariadb_root_password }}"
     - name: MYSQL_PASSWORD
       value: "{{ mariadb_user_password }}"
+    - name: RESTIC_PASSWORD
+      value: "{{ mariadb_backup_restic_password }}"
+    - name: AWS_ACCESS_KEY_ID
+      value: "{{ mariadb_backup_aws_access_key_id }}"
+    - name: AWS_SECRET_ACCESS_KEY
+      value: "{{ mariadb_backup_aws_secret_access_key }}"
 
 mariadb_service_port: 3306
 mariadb_database: appdb
@@ -105,3 +150,31 @@ mariadb_root_password: "{{ lookup('env', 'MARIADB_ROOT_PASSWORD') | default('cha
 mariadb_user_password: "{{ lookup('env', 'MARIADB_USER_PASSWORD') | default('change-me-user', true) }}"
 mariadb_kubernetes_namespace: databases
 mariadb_kubernetes_replicas: 1
+mariadb_publish_port: false
+mariadb_internal_network: mariadb-internal
+mariadb_allowed_cidrs:
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+mariadb_backups:
+  logical:
+    enabled: true
+    tool: mysqldump
+    schedule: "0 2 * * *"
+    restic_repository: "{{ mariadb_backup_restic_repository }}"
+    retention:
+      keep_daily: 7
+      keep_weekly: 4
+      keep_monthly: 6
+  physical:
+    enabled: false
+    tool: innobackupex
+  binlog_shipping:
+    enabled: true
+    s3_path: "{{ mariadb_binlog_s3_path }}"
+    retention_hours: 168
+mariadb_backup_restic_repository: "{{ lookup('env', 'MARIADB_RESTIC_REPOSITORY') | default('s3:s3.amazonaws.com/example-bucket/mariadb', true) }}"
+mariadb_backup_restic_password: "{{ lookup('env', 'MARIADB_RESTIC_PASSWORD') | default('change-me-restic', true) }}"
+mariadb_backup_aws_access_key_id: "{{ lookup('env', 'MARIADB_AWS_ACCESS_KEY_ID') | default('change-me-access-key', true) }}"
+mariadb_backup_aws_secret_access_key: "{{ lookup('env', 'MARIADB_AWS_SECRET_ACCESS_KEY') | default('change-me-secret', true) }}"
+mariadb_binlog_s3_path: "{{ lookup('env', 'MARIADB_BINLOG_S3_PATH') | default('s3://example-bucket/mariadb/binlog', true) }}"

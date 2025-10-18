@@ -20,16 +20,30 @@ DATABASE_USER={{ mariadb_user }}
 ### Secrets
 - `MYSQL_ROOT_PASSWORD` -> root account password
 - `MYSQL_PASSWORD` -> application user password
+- `RESTIC_PASSWORD` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` -> credentials for the automated Restic backup jobs
 
-Both default to environment lookups (`MARIADB_ROOT_PASSWORD` / `MARIADB_USER_PASSWORD`) with placeholder fallbacks; override them through inventory or Ansible vault.
+All secrets must be provided through inventory, Vault, or an external secret manager. The role asserts that the placeholder defaults are never used at runtime.
+
+### Security & Networking
+- Host publishing of TCP/3306 is disabled by default (`mariadb_publish_port: false`). If a host mapping is really required, explicitly opt-in and review firewall policy.
+- Container runtimes attach the database to a dedicated internal bridge network (`mariadb_internal_network`) that is not exposed publicly.
+- `service_firewall` seeds iptables and Proxmox firewall rules that only permit RFC1918 source CIDRs by default (`mariadb_allowed_cidrs`); tailor to your private address space.
+- Kubernetes runtimes render a `ClusterIP` Service alongside a restrictive `NetworkPolicy` that limits ingress to in-namespace workloads unless overridden.
+
+### Backups & PITR
+- `mariadb_backups.logical` enables nightly `mysqldump` exports that are piped into Restic for deduplicated storage in object stores (S3, MinIO, etc.). Adjust the cron `schedule` and retention knobs as needed.
+- Populate `RESTIC_PASSWORD`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY` secrets to authenticate to the Restic repository specified via `mariadb_backup_restic_repository`.
+- Optional `mariadb_backups.physical` toggles Percona `innobackupex` workflows for larger datasets that need hot physical copies.
+- `mariadb_backups.binlog_shipping` streams MariaDB binary logs to S3 for point-in-time recovery; customize the S3 path and retention per compliance needs.
 
 ### Health Check
-`mysqladmin ping -h 127.0.0.1 -P {{ mariadb_service_port }}` with a 10s interval, 5s timeout, and 5 retries. The same command feeds Docker healthchecks, Quadlet probes, Kubernetes readiness/liveness, and the post-deploy gate.
+`mysqladmin ping -h 127.0.0.1 -P {{ mariadb_service_port }}` with a 10s interval, 5s timeout, start period of 30s, failure threshold of 3, success threshold of 1, and 5 retries. The same command feeds Docker healthchecks, Quadlet probes, Kubernetes readiness/liveness, and the post-deploy gate.
 
 ### Key Overrides
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `mariadb_service_port` | `3306` | Published TCP port |
+| `mariadb_service_port` | `3306` | Internal TCP port |
+| `mariadb_publish_port` | `false` | Opt-in host publishing of TCP/3306 |
 | `mariadb_database` | `appdb` | Default schema created for workloads |
 | `mariadb_user` | `app` | Application database user |
 | `mariadb_data_volume` | `mariadb-data` | Named volume for container targets |
@@ -38,6 +52,9 @@ Both default to environment lookups (`MARIADB_ROOT_PASSWORD` / `MARIADB_USER_PAS
 | `mariadb_container_storage_gb` | `50` | Storage allocation for both PVC and LXC disk |
 | `mariadb_container_cpu_cores` | `2` | CPU allocation across runtimes |
 | `mariadb_container_memory_mb` | `2048` | Memory allocation across runtimes |
+| `mariadb_allowed_cidrs` | RFC1918 ranges | Sources allowed through firewall policy |
+| `mariadb_backups.logical.schedule` | `0 2 * * *` | Nightly logical dump cadence |
+| `mariadb_backups.binlog_shipping.retention_hours` | `168` | Retention for shipped binary logs |
 | `mariadb_kubernetes_namespace` | `databases` | Namespace for Deployment/Service/PVC |
 
 Adjust these in inventory to tune runtime specifics. Any additional runtime template parameters can be supplied by extending the defaults with extra keys consumed by the shared templates.
@@ -53,4 +70,8 @@ Adjust these in inventory to tune runtime specifics. Any additional runtime temp
         mariadb_user: erpnext
         mariadb_root_password: "{{ vault_mariadb_root_password }}"
         mariadb_user_password: "{{ vault_mariadb_user_password }}"
+        mariadb_backup_restic_password: "{{ vault_mariadb_restic_password }}"
+        mariadb_backup_aws_access_key_id: "{{ vault_mariadb_backup_access_key }}"
+        mariadb_backup_aws_secret_access_key: "{{ vault_mariadb_backup_secret_key }}"
+        mariadb_binlog_s3_path: s3://prod-backups/mariadb/binlog
 ```
