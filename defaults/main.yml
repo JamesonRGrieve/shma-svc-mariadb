@@ -25,6 +25,18 @@ service_env:
         '--innodb-buffer-pool-size=' ~ mariadb_innodb_buffer_pool_size,
         '--max-connections=' ~ (mariadb_max_connections | string)
       ] | join(' ') }}
+  - name: MARIADB_HEALTH_CONNECTION_THRESHOLD
+    value: "{{ mariadb_health_connection_threshold_count | string }}"
+  - name: MARIADB_HEALTH_DISK_THRESHOLD
+    value: "{{ mariadb_health_disk_usage_threshold | string }}"
+  - name: MARIADB_HEALTH_WEBHOOK_URL
+    value: "{{ mariadb_health_webhook_url if mariadb_health_webhook_url else omit }}"
+  - name: MARIADB_HEALTH_REPLICATION_ENABLED
+    value: "{{ 'true' if mariadb_replication_enabled else 'false' }}"
+  - name: MARIADB_HEALTH_PORT
+    value: "{{ mariadb_service_port | string }}"
+  - name: SERVICE_NAME
+    value: "{{ service_name }}"
 service_networks:
   - name: "{{ mariadb_internal_network }}"
     driver: bridge
@@ -57,84 +69,7 @@ service_files:
     owner: root
     group: root
     mode: "0755"
-    content: |-
-      #!/usr/bin/env bash
-      set -euo pipefail
-
-      HOST="127.0.0.1"
-      PORT="{{ mariadb_service_port }}"
-      DATA_DIR="/var/lib/mysql"
-      WEBHOOK_URL="{{ mariadb_health_webhook_url }}"
-
-      notify_webhook() {
-        local payload="$1"
-        if [[ -n "$WEBHOOK_URL" ]] && command -v curl >/dev/null 2>&1; then
-          local escaped_payload
-          escaped_payload=$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read())[1:-1])' 2>/dev/null || printf '%s' "$payload" | sed 's/"/\\"/g')
-          curl -fsS -X POST -H 'Content-Type: application/json' -d "{\"service\":\"{{ service_name }}\",\"status\":\"unhealthy\",\"message\":\"${escaped_payload}\"}" "$WEBHOOK_URL" || true
-        fi
-      }
-
-      fail() {
-        local message="$1"
-        echo "$message" >&2
-        notify_webhook "$message"
-        exit 1
-      }
-
-      MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-}"
-      if [[ -z "$MYSQL_ROOT_PASSWORD" ]]; then
-        fail "MYSQL_ROOT_PASSWORD is not available to health check"
-      fi
-      export MYSQL_PWD="$MYSQL_ROOT_PASSWORD"
-
-      if ! mysqladmin ping -h "$HOST" -P "$PORT" -uroot --connect-timeout=5 >/dev/null 2>&1; then
-        fail "mysqladmin ping failed"
-      fi
-
-      threads=$(mysql -h "$HOST" -P "$PORT" -uroot -Nse "SHOW GLOBAL STATUS LIKE 'Threads_connected';" 2>/dev/null | awk '{print $2}')
-      threads=${threads:-0}
-      if [[ -z "$threads" ]]; then
-        fail "Unable to read Threads_connected"
-      fi
-
-      max_connections={{ mariadb_max_connections | int }}
-      threshold={{ mariadb_health_connection_threshold_count | int }}
-      if (( threshold < 1 )); then
-        threshold=1
-      fi
-
-      if (( threads >= max_connections )); then
-        fail "Threads_connected $threads reached configured max_connections $max_connections"
-      fi
-
-      if (( threads >= threshold )); then
-        fail "Threads_connected $threads exceeded alert threshold $threshold"
-      fi
-
-      disk_pct=$(df --output=pcent "$DATA_DIR" 2>/dev/null | tail -1 | tr -dc '0-9')
-      disk_pct=${disk_pct:-0}
-      if (( disk_pct >= {{ mariadb_health_disk_usage_threshold | int }} )); then
-        fail "Disk utilization ${disk_pct}% at $DATA_DIR exceeds {{ mariadb_health_disk_usage_threshold }}% threshold"
-      fi
-
-{% if mariadb_replication_enabled %}
-      replication_status=$(mysql -h "$HOST" -P "$PORT" -uroot -e "SHOW REPLICA STATUS\G" 2>/dev/null || true)
-      if [[ -z "$replication_status" ]]; then
-        replication_status=$(mysql -h "$HOST" -P "$PORT" -uroot -e "SHOW SLAVE STATUS\G" 2>/dev/null || true)
-      fi
-      if [[ -z "$replication_status" ]]; then
-        fail "Replication status unavailable"
-      fi
-      if ! grep -q "Slave_IO_Running: Yes" <<<"$replication_status"; then
-        fail "Replication IO thread not running"
-      fi
-      if ! grep -q "Slave_SQL_Running: Yes" <<<"$replication_status"; then
-        fail "Replication SQL thread not running"
-      fi
-{% endif %}
-
-      echo "ok"
+    content: "{{ lookup('file', 'mariadb-healthcheck.sh') }}"
 service_firewall:
   iptables:
     inbound:
@@ -273,11 +208,9 @@ mariadb_schema_privilege_levels:
     grant_option: true
 mariadb_schema_default_state: present
 mariadb_exports_include_credentials: false
-mariadb_exports_directory: /srv/db/exports
-mariadb_exports_directory_mode: "0755"
-mariadb_exports_file_mode: "0640"
-mariadb_exports_owner: root
-mariadb_exports_group: root
+mariadb_exports_delivery: stdout
+mariadb_exports_configmap_name: "{{ service_id }}-schema-exports"
+mariadb_exports_secret_name: "{{ service_id }}-schema-exports"
 mariadb_health_disk_usage_threshold: 90
 mariadb_health_connection_utilization_threshold: 0.9
 mariadb_health_connection_threshold_count: "{{ (mariadb_max_connections * mariadb_health_connection_utilization_threshold) | round(0, 'floor') | int }}"
@@ -300,8 +233,10 @@ mariadb_container_memory_mb: 2048
 mariadb_container_swap_mb: 2048
 mariadb_container_storage_gb: 50
 mariadb_container_template: local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
-mariadb_root_password: "{{ lookup('env', 'MARIADB_ROOT_PASSWORD') | default('change-me-root', true) }}"
-mariadb_user_password: "{{ lookup('env', 'MARIADB_USER_PASSWORD') | default('change-me-user', true) }}"
+mariadb_root_password_placeholder: change-me-root
+mariadb_user_password_placeholder: change-me-user
+mariadb_root_password: "{{ lookup('env', 'MARIADB_ROOT_PASSWORD') | default(mariadb_root_password_placeholder, true) }}"
+mariadb_user_password: "{{ lookup('env', 'MARIADB_USER_PASSWORD') | default(mariadb_user_password_placeholder, true) }}"
 mariadb_kubernetes_namespace: databases
 mariadb_kubernetes_replicas: 1
 mariadb_publish_port: false
@@ -339,8 +274,14 @@ mariadb_backups:
     s3_path: "{{ mariadb_binlog_s3_path }}"
     retention_hours: 168
     checksum: md5
-mariadb_backup_restic_repository: "{{ lookup('env', 'MARIADB_RESTIC_REPOSITORY') | default('s3:s3.amazonaws.com/example-bucket/mariadb', true) }}"
-mariadb_backup_restic_password: "{{ lookup('env', 'MARIADB_RESTIC_PASSWORD') | default('change-me-restic', true) }}"
-mariadb_backup_aws_access_key_id: "{{ lookup('env', 'MARIADB_AWS_ACCESS_KEY_ID') | default('change-me-access-key', true) }}"
-mariadb_backup_aws_secret_access_key: "{{ lookup('env', 'MARIADB_AWS_SECRET_ACCESS_KEY') | default('change-me-secret', true) }}"
-mariadb_binlog_s3_path: "{{ lookup('env', 'MARIADB_BINLOG_S3_PATH') | default('s3://example-bucket/mariadb/binlog', true) }}"
+mariadb_backup_restic_repository_placeholder: s3:s3.amazonaws.com/example-bucket/mariadb
+mariadb_backup_restic_password_placeholder: change-me-restic
+mariadb_backup_aws_access_key_id_placeholder: change-me-access-key
+mariadb_backup_aws_secret_access_key_placeholder: change-me-secret
+mariadb_backup_restic_repository: "{{ lookup('env', 'MARIADB_RESTIC_REPOSITORY') | default(mariadb_backup_restic_repository_placeholder, true) }}"
+mariadb_backup_restic_password: "{{ lookup('env', 'MARIADB_RESTIC_PASSWORD') | default(mariadb_backup_restic_password_placeholder, true) }}"
+mariadb_backup_aws_access_key_id: "{{ lookup('env', 'MARIADB_AWS_ACCESS_KEY_ID') | default(mariadb_backup_aws_access_key_id_placeholder, true) }}"
+mariadb_backup_aws_secret_access_key: "{{ lookup('env', 'MARIADB_AWS_SECRET_ACCESS_KEY') | default(mariadb_backup_aws_secret_access_key_placeholder, true) }}"
+mariadb_backup_aws_region: "{{ lookup('env', 'MARIADB_AWS_REGION') | default(omit, true) }}"
+mariadb_binlog_s3_path_placeholder: s3://example-bucket/mariadb/binlog
+mariadb_binlog_s3_path: "{{ lookup('env', 'MARIADB_BINLOG_S3_PATH') | default(mariadb_binlog_s3_path_placeholder, true) }}"

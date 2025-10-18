@@ -4,20 +4,18 @@
     name: common.validate_schema
 
 - name: Ensure MariaDB secrets are overridden
-  vars:
-    mariadb_default_passwords:
-      - change-me-root
-      - change-me-user
   assert:
     that:
       - mariadb_root_password is defined
       - mariadb_user_password is defined
       - mariadb_root_password | length > 0
       - mariadb_user_password | length > 0
-      - mariadb_root_password not in mariadb_default_passwords
-      - mariadb_user_password not in mariadb_default_passwords
+      - mariadb_root_password not in [mariadb_root_password_placeholder, mariadb_user_password_placeholder]
+      - mariadb_user_password not in [mariadb_root_password_placeholder, mariadb_user_password_placeholder]
+      - mariadb_root_password | mariadb_password_is_strong
+      - mariadb_user_password | mariadb_password_is_strong
   fail_msg: >-
-      MariaDB root/user credentials must be provided via secrets or vault entries; the default placeholders are insecure.
+      MariaDB root/user credentials must be provided via secrets or vault entries; the default placeholders are insecure and passwords must be at least 16 characters with mixed case, digits, and special characters.
 
 - name: Validate firewall CIDR configuration
   assert:
@@ -31,10 +29,10 @@
   when: mariadb_backups.logical.enabled | bool
   vars:
     mariadb_backup_placeholder_values:
-      - change-me-restic
-      - change-me-access-key
-      - change-me-secret
-      - s3:s3.amazonaws.com/example-bucket/mariadb
+      - "{{ mariadb_backup_restic_password_placeholder }}"
+      - "{{ mariadb_backup_aws_access_key_id_placeholder }}"
+      - "{{ mariadb_backup_aws_secret_access_key_placeholder }}"
+      - "{{ mariadb_backup_restic_repository_placeholder }}"
   assert:
     that:
       - mariadb_backup_restic_repository is defined
@@ -62,9 +60,9 @@
       Logical backup retention must satisfy keep_monthly >= keep_weekly >= keep_daily to avoid overlapping pruning windows.
 
 - name: Perform Restic repository preflight check
-  when:
-    - mariadb_backups.logical.enabled | bool
-    - mariadb_backups.logical.verify_repository | default(false)
+  when: mariadb_backups.logical.enabled | bool
+  tags:
+    - verify-backups
   command:
     argv:
       - restic
@@ -85,102 +83,70 @@
     that:
       - mariadb_binlog_s3_path is defined
       - mariadb_binlog_s3_path | length > 0
-      - mariadb_binlog_s3_path != 's3://example-bucket/mariadb/binlog'
-    fail_msg: >-
+      - mariadb_binlog_s3_path != mariadb_binlog_s3_path_placeholder
+  fail_msg: >-
       Configure a production S3 path for binlog shipping to guarantee point-in-time recovery.
 
-- name: Initialize resolved schema definitions
+- name: Validate binlog shipping credentials
+  when: mariadb_backups.binlog_shipping.enabled | bool
+  assert:
+    that:
+      - mariadb_backup_aws_access_key_id is defined
+      - mariadb_backup_aws_secret_access_key is defined
+      - mariadb_backup_aws_access_key_id not in [mariadb_backup_aws_access_key_id_placeholder]
+      - mariadb_backup_aws_secret_access_key not in [mariadb_backup_aws_secret_access_key_placeholder]
+  fail_msg: >-
+      Binlog shipping requires dedicated AWS credentials; provide non-placeholder access and secret keys.
+
+- name: Parse binlog shipping destination
+  when: mariadb_backups.binlog_shipping.enabled | bool
   set_fact:
-    mariadb_resolved_schemas: []
+    mariadb_binlog_s3_components: "{{ mariadb_binlog_s3_path | mariadb_parse_s3_url }}"
 
-- name: Validate multi-schema configuration
-  when: (mariadb_schemas | length) > 0
-  block:
-    - name: Ensure schema definitions declare name, users, and valid state
-      assert:
-        that:
-          - item.name is defined
-          - item.name | length > 0
-          - item.name not in mariadb_reserved_schema_names
-          - item.users is defined
-          - item.users | length > 0
-          - (item.state | default(mariadb_schema_default_state)) in ['present', 'absent']
-        fail_msg: >-
-          Each entry in mariadb_schemas must define a non-reserved name, at least one user, and a state of present|absent.
-      loop: "{{ mariadb_schemas }}"
-      loop_control:
-        label: "{{ item.name | default('unnamed') }}"
+- name: Generate binlog shipping preflight object key
+  when: mariadb_backups.binlog_shipping.enabled | bool
+  set_fact:
+    mariadb_binlog_preflight_object: "{{ mariadb_binlog_s3_components.prefix | mariadb_preflight_key }}"
 
-    - name: Ensure schema user definitions are complete
-      vars:
-        schema_item: "{{ item.0 }}"
-        user_item: "{{ item.1 }}"
-        privilege_level: "{{ user_item.privilege_level | default('standard') }}"
-      assert:
-        that:
-          - user_item.name is defined
-          - user_item.name | length > 0
-          - (user_item.password is defined) or (user_item.password_var is defined)
-          - privilege_level in mariadb_schema_privilege_levels.keys()
-        fail_msg: >-
-          Schema {{ schema_item.name }} user definitions must include a username, credentials, and an optional privilege_level from {{ mariadb_schema_privilege_levels.keys() | list }}.
-      loop: "{{ mariadb_schemas | subelements('users') }}"
-      loop_control:
-        label: "{{ item.0.name }}::{{ item.1.name | default('unnamed-user') }}"
+- name: Upload binlog shipping preflight object
+  when: mariadb_backups.binlog_shipping.enabled | bool
+  amazon.aws.s3_object:
+    bucket: "{{ mariadb_binlog_s3_components.bucket }}"
+    object: "{{ mariadb_binlog_preflight_object }}"
+    content: mariadb binlog shipping preflight validation
+    mode: put
+    access_key: "{{ mariadb_backup_aws_access_key_id }}"
+    secret_key: "{{ mariadb_backup_aws_secret_access_key }}"
+    region: "{{ mariadb_backup_aws_region | default(omit) }}"
+  delegate_to: localhost
+  run_once: true
+  register: mariadb_binlog_preflight_upload
+  changed_when: false
+  no_log: true
 
-    - name: Resolve schema credentials and privileges
-      vars:
-        schema_item: "{{ item }}"
-        schema_state: "{{ item.state | default(mariadb_schema_default_state) }}"
-      block:
-        - set_fact:
-            mariadb_current_schema_users: []
+- name: Remove binlog shipping preflight object
+  when: mariadb_backups.binlog_shipping.enabled | bool
+  amazon.aws.s3_object:
+    bucket: "{{ mariadb_binlog_s3_components.bucket }}"
+    object: "{{ mariadb_binlog_preflight_object }}"
+    mode: delete
+    access_key: "{{ mariadb_backup_aws_access_key_id }}"
+    secret_key: "{{ mariadb_backup_aws_secret_access_key }}"
+    region: "{{ mariadb_backup_aws_region | default(omit) }}"
+  delegate_to: localhost
+  run_once: true
+  changed_when: false
+  no_log: true
 
-        - name: Resolve users for schema {{ schema_item.name }}
-          vars:
-            user_password_var: "{{ user.password_var | default(None) }}"
-            user_password_raw: >-
-              {% if user.password is defined %}
-              {{ user.password }}
-              {% elif user_password_var is not none %}
-              {{ lookup('vars', user_password_var, default='') }}
-              {% else %}
-              {% endif %}
-            user_password_trimmed: "{{ user_password_raw | trim }}"
-            privilege_level: "{{ user.privilege_level | default('standard') }}"
-            privilege_spec: "{{ mariadb_schema_privilege_levels[privilege_level] }}"
-            privilege_list: "{{ user.privileges | default(privilege_spec.privileges) }}"
-            grant_option_flag: "{{ user.grant_option | default(privilege_spec.grant_option | default(false)) }}"
-            privilege_values: "{{ (privilege_list if (privilege_list is iterable and privilege_list is not string) else privilege_list.split(',')) | map('trim') | list }}"
-          block:
-            - assert:
-                that:
-                  - user_password_trimmed | length > 0
-                fail_msg: >-
-                  Passwords referenced by mariadb_schemas for user {{ user.name }} in schema {{ schema_item.name }} must resolve to non-empty values. Verify the password/password_var entries.
 
-            - set_fact:
-                mariadb_current_schema_users: "{{ mariadb_current_schema_users + [ {
-                  'name': user.name,
-                  'password': user_password_trimmed,
-                  'privileges': privilege_values,
-                  'grant_option': grant_option_flag | bool
-                } ] }}"
-          loop: "{{ schema_item.users }}"
-          loop_control:
-            loop_var: user
-            label: "{{ user.name }}"
-          no_log: true
+- name: Normalize schema definitions
+  set_fact:
+    mariadb_validated_schemas: "{{ mariadb_schemas | default([]) | mariadb_normalize_schemas(mariadb_schema_default_state, mariadb_reserved_schema_names, mariadb_schema_privilege_levels) }}"
 
-        - set_fact:
-            mariadb_resolved_schemas: "{{ (mariadb_resolved_schemas | default([])) + [ {
-              'name': schema_item.name,
-              'state': schema_state,
-              'users': mariadb_current_schema_users
-            } ] }}"
-      loop: "{{ mariadb_schemas }}"
-      loop_control:
-        label: "{{ item.name }}"
+- name: Resolve schema credentials and privileges
+  set_fact:
+    mariadb_resolved_schemas: "{{ mariadb_validated_schemas | mariadb_resolve_schemas(vars) }}"
+  no_log: true
 
 - name: Partition schemas by desired state
   when: (mariadb_resolved_schemas | length) > 0
@@ -294,8 +260,8 @@
 
 - name: Remove remote root accounts
   vars:
-    mariadb_root_hosts_to_remove: "{{ (mariadb_root_disallowed_hosts_resolved | difference(mariadb_root_allowed_hosts_resolved))
-      | intersect(mariadb_root_existing_hosts | default([])) }}"
+    mariadb_root_hosts_to_remove: "{{ (((mariadb_root_existing_hosts | default([])) | difference(mariadb_root_allowed_hosts_resolved))
+      | union(mariadb_root_disallowed_hosts_resolved | difference(mariadb_root_allowed_hosts_resolved))) | unique }}"
   when: (mariadb_root_hosts_to_remove | length) > 0
   community.mysql.mysql_user:
     name: root
@@ -410,73 +376,52 @@
     label: "{{ user_item.name }}@{{ schema_item.name }}"
   no_log: true
 
-- name: Ensure schema export directory exists
-  file:
-    path: "{{ mariadb_exports_directory }}"
-    state: directory
-    owner: "{{ mariadb_exports_owner }}"
-    group: "{{ mariadb_exports_group }}"
-    mode: "{{ mariadb_exports_directory_mode }}"
+- name: Validate schema export delivery mode
+  assert:
+    that:
+      - mariadb_exports_delivery in ['stdout', 'configmap', 'secret', 'none']
+  fail_msg: >-
+      mariadb_exports_delivery must be one of stdout, configmap, secret, or none.
 
-- name: Initialize expected schema exports
-  when: (mariadb_present_schemas | default([])) | length > 0
+- name: Build schema export payloads
+  when:
+    - (mariadb_resolved_schemas | default([])) | length > 0
+    - mariadb_exports_delivery != 'none'
   set_fact:
-    mariadb_expected_exports: []
+    mariadb_schema_exports: "{{ mariadb_resolved_schemas | mariadb_schema_exports(service_id, service_ip, mariadb_service_port, version, mariadb_exports_include_credentials) }}"
+  no_log: "{{ mariadb_exports_include_credentials | bool }}"
 
-- name: Build schema export manifest
-  when: (mariadb_present_schemas | default([])) | length > 0
-  vars:
-    schema_item: "{{ item.0 }}"
-    user_item: "{{ item.1 }}"
-    schema_safe: "{{ schema_item.name | regex_replace('[^A-Za-z0-9_.-]', '_') }}"
-    user_safe: "{{ user_item.name | regex_replace('[^A-Za-z0-9_.-]', '_') }}"
-    export_filename: "{{ service_id }}-{{ schema_safe }}-{{ user_safe }}.env"
-    export_path: "{{ [mariadb_exports_directory, export_filename] | path_join }}"
+- name: Build schema export mapping
+  when: (mariadb_schema_exports | default([])) | length > 0
   set_fact:
-    mariadb_expected_exports: "{{ mariadb_expected_exports + [ {
-      'schema': schema_item.name,
-      'user': user_item.name,
-      'password': user_item.password,
-      'path': export_path
-    } ] }}"
-  loop: "{{ mariadb_present_schemas | subelements('users') }}"
+    mariadb_schema_export_map: "{{ mariadb_schema_exports | mariadb_schema_export_map }}"
+  no_log: "{{ mariadb_exports_include_credentials | bool }}"
+
+- name: Emit schema exports to stdout
+  when:
+    - (mariadb_schema_exports | default([])) | length > 0
+    - mariadb_exports_delivery == 'stdout'
+  debug:
+    msg: |-
+      {{ item.key }}
+      {{ item.content | trim }}
+  loop: "{{ mariadb_schema_exports }}"
   loop_control:
-    label: "{{ user_item.name }}@{{ schema_item.name }}"
+    label: "{{ item.key }}"
+  no_log: "{{ mariadb_exports_include_credentials | bool }}"
+
+- name: Publish schema exports as ConfigMap
+  when:
+    - (mariadb_schema_exports | default([])) | length > 0
+    - mariadb_exports_delivery == 'configmap'
+  set_fact:
+    exports: "{{ exports | default({}) | combine({'configmaps': (exports.configmaps | default([])) + [ { 'name': mariadb_exports_configmap_name, 'data': mariadb_schema_export_map } ]}, recursive=True) }}"
+  no_log: "{{ mariadb_exports_include_credentials | bool }}"
+
+- name: Publish schema exports as Secret
+  when:
+    - (mariadb_schema_exports | default([])) | length > 0
+    - mariadb_exports_delivery == 'secret'
+  set_fact:
+    exports: "{{ exports | default({}) | combine({'secrets': (exports.secrets | default([])) + [ { 'name': mariadb_exports_secret_name, 'stringData': mariadb_schema_export_map } ]}, recursive=True) }}"
   no_log: true
-
-- name: Render per-schema export files
-  when: (mariadb_expected_exports | default([])) | length > 0
-  copy:
-    dest: "{{ item.path }}"
-    content: |-
-      DATABASE_HOST={{ service_ip }}
-      DATABASE_PORT={{ mariadb_service_port }}
-      DATABASE_NAME={{ item.schema }}
-      DATABASE_USER={{ item.user }}
-      {% if mariadb_exports_include_credentials %}DATABASE_PASSWORD={{ item.password }}
-      {% endif %}DATABASE_VERSION={{ version }}
-    owner: "{{ mariadb_exports_owner }}"
-    group: "{{ mariadb_exports_group }}"
-    mode: "{{ mariadb_exports_file_mode }}"
-  loop: "{{ mariadb_expected_exports }}"
-  loop_control:
-    label: "{{ item.user }}@{{ item.schema }}"
-  no_log: true
-
-- name: Remove orphaned schema export files
-  find:
-    paths: "{{ mariadb_exports_directory }}"
-    patterns: "{{ service_id }}-*.env"
-    file_type: file
-  register: mariadb_existing_export_files
-
-- name: Prune stale schema exports
-  vars:
-    expected_paths: "{{ mariadb_expected_exports | default([]) | map(attribute='path') | list }}"
-  file:
-    path: "{{ item.path }}"
-    state: absent
-  when: item.path not in expected_paths
-  loop: "{{ mariadb_existing_export_files.files | default([]) }}"
-  loop_control:
-    label: "{{ item.path | basename }}"
